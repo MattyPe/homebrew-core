@@ -1,0 +1,1182 @@
+	// ***************************************************************** //
+	//                          DYKcheck tool                            //
+	//                           Version 1.1                             //
+	// For quick installation, add                                       //
+	// importScript('User:Shubinator/DYKcheck.js');                      //
+	// to your vector.js                                                 //
+	// See [[User:Shubinator/DYKcheck]] for more info, including         //
+	// configurable options and how to use the tool without installation //
+	// or logging in.                                                    //
+	// First version written by Shubinator in February 2009              //
+	// ***************************************************************** //
+
+mw.loader.using(['mediawiki.api', 'mediawiki.util'], function () {
+"use strict";
+
+var onTTDYK, nextSection, urlJump, sections, currentTitle, partsProcessing,
+	articleTitles, dates, nom5x;
+
+// Configurable options
+var
+	dateFormat = window.dateFormat,
+	unlock = window.unlock,
+	hookLengthYellow = window.hookLengthYellow || 200,
+	hookLengthRed = window.hookLengthRed || 220,
+	check5xNoms = window.check5xNoms || "ifnom5x",
+	fixedSidebar = window.fixedSidebar || "onttydk";
+
+var mwConfig = mw.config.get([
+	"wgAction",
+	"wgTitle",
+	"wgPageName",
+	"wgUserName",
+	"wgNamespaceNumber",
+	"skin"
+]);
+
+var api = new mw.Api();
+
+// Polyfill String.prototype.includes so that we don't have to write "!== -1" all over
+// the codebase.
+if (!String.prototype.includes) {
+  String.prototype.includes = function() {
+    return String.prototype.indexOf.apply(this, arguments) !== -1;
+  };
+}
+
+function escapeHtml(s) {
+	// Use the browser's built-in ability to escape HTML.
+	var div = document.createElement('div');
+	div.appendChild(document.createTextNode(s));
+	return div.innerHTML;
+}
+
+function scanArticle(title, output, html) {
+	// the meat of the DYKcheck tool
+	// calculates prose size of the given html
+	// checks for inline citations and stub templates in the given html
+	// passes info to checkTalk(), getFirstRevision(), checkMove(), and checkExpansion()
+	
+	if (!onTTDYK || (check5xNoms === "always") || (check5xNoms === "ifnom5x" && nom5x)) {
+		partsProcessing = new Array(4);
+	} else {
+		partsProcessing = new Array(3);
+	}
+	dates = new Array(4);
+
+	var proseDisp = document.createElement("li");
+	proseDisp.id = "dyk-prose";
+	output.appendChild(proseDisp);
+
+	// calculate prose size
+	var prose = calculateProse(html, true);
+	var pList = html.getElementsByTagName("p");
+	var word_count = 0;
+	for (var iPara = 0;iPara < pList.length; iPara++) {
+		var para = pList[iPara];
+		if (para.parentNode.parentNode === html || para.parentNode.parentNode.parentNode.id === getBodyId()) {
+			word_count += para.innerHTML.replace(/(<([^>]+)>)/ig,"").split(' ').length;
+		}
+	}
+	proseDisp.innerHTML='<b>Prose size (text only): </b>' + escapeHtml(prose) + '&nbsp;characters (' +
+			escapeHtml(word_count) + ' words) "readable prose size"';
+	if (prose < 1500) {
+		proseDisp.style.cssText = "background-color:pink";
+	}
+	
+	// check for inline citations
+	if (!html.innerHTML.includes('id="cite_ref-') && !html.innerHTML.includes('id=cite_ref-')) {
+		var noref = document.createElement("li");
+		noref.id = "no-ref";
+		output.appendChild(noref);
+		noref.innerHTML = 'No inline citations';
+		noref.style.cssText = "background-color:pink";
+	}
+	
+	// check if article is stub or if it has appeared in DYK or ITN
+	if (html.innerHTML.includes('id="stub"') || html.innerHTML.includes('id=stub') || 
+			html.innerHTML.includes('metadata plainlinks stub')) {
+		var stubAlert = document.createElement("li");
+		stubAlert.id = "stub-alert";
+		output.appendChild(stubAlert);
+		stubAlert.innerHTML = 'Article is classified as a stub';
+		stubAlert.style.cssText = "background-color:yellow";
+	}
+	checkTalk(title, output); //check talk page
+	
+	// check for various tags
+	var alertColor = "yellow";
+	var imageList = new Array("Text_document_with_red_question_mark.svg", 
+			"Question book-new.svg", "Ambox content.png", "Ambox style.png", 
+			"Imbox style.png", "Copyright-problem.svg", "Copyright-problem paste.svg", 
+			"Ambox globe content.svg", "Unbalanced scales.svg", "Ambox scales.svg", 
+			"Ambox_contradict.svg", "Ambox warning orange.svg", "Acap.svg");
+	var tagList = new Array("unverified content", "insufficient citations", "dispute", "cleanup", "cleanup",
+			"copyright violations", "copyright violations", "globalization", "neutrality", 
+			"neutrality", "contradiction", "dispute", "copyedit");
+	var tagsFound = false;
+	var tagAlert = document.createElement("li");
+	if (html.innerHTML.includes("This article is being considered for deletion in accordance with Wikipedia's")) {
+		tagsFound = true;
+		var afdIndex = html.innerHTML.indexOf('title="Wikipedia:Articles for deletion/') + 7;
+		var afdLink = html.innerHTML.substring(afdIndex, html.innerHTML.indexOf('"', afdIndex));
+		var afdBoldTag = document.createElement("b");
+		var afdLinkTag = document.createElement("a");
+		afdLinkTag.setAttribute("href", "//en.wikipedia.org/wiki/" + afdLink);
+		afdLinkTag.appendChild(document.createTextNode("nominated for deletion"));
+		afdBoldTag.appendChild(afdLinkTag);
+		tagAlert.appendChild(document.createTextNode("Article has been "));
+		tagAlert.appendChild(afdBoldTag);
+		tagAlert.appendChild(document.createTextNode(". "));
+		alertColor = "pink";			
+	} else if ((html.innerHTML.toLowerCase().includes('<table class="plainlinks ombox ombox-speedy"')) || 
+			(html.innerHTML.toLowerCase().includes('<table class="plainlinks ambox ambox-speedy"')) || 
+			(html.innerHTML.toLowerCase().includes('<table class="metadata plainlinks ombox ombox-speedy"')) ||
+			(html.innerHTML.toLowerCase().includes('<table class="metadata plainlinks ambox ambox-speedy"'))) {
+		tagsFound = true;
+		tagAlert.appendChild("Article has been <b>tagged for speedy deletion</b>. ");
+		alertColor = "pink";
+	}
+	for (var iImage = 0; iImage < imageList.length; iImage++) {
+		if (html.innerHTML.includes(imageList[iImage])) {
+			tagsFound = true;
+			tagAlert.appendChild(document.createTextNode("Article has a "));
+			tagAlert.appendChild(document.createTextNode(tagList[iImage]));
+			tagAlert.appendChild(document.createTextNode(" tag. "));
+		}
+	}
+	if (tagsFound) {
+		tagAlert.id = "tag-alert";
+		tagAlert.style["background-color"] = alertColor;
+		output.appendChild(tagAlert);
+	}
+		
+	// find creator of article and date
+	getFirstRevision(title, output);
+	
+	// check if the article has been moved from userspace within last 100 edits
+	if (mwConfig.wgNamespaceNumber !== 2) {
+		checkMove(title, output);
+	} else {
+		partsProcessing[2] = true;
+	}/*  */
+	
+	// check for expansion start date, assuming now expanded to 5x (last 500 edits)
+	if (!onTTDYK || (check5xNoms === "always") || (check5xNoms === "ifnom5x" && nom5x)) {
+		checkExpansion(title, output, prose);
+	}
+}
+
+function checkDocument() {
+	// prepares for scan and passes info to scanArticle()
+	onTTDYK = false;
+	if (document.getElementById("dyk-stats-0")) {
+		clearStats();
+	} else {
+		var output = document.createElement("ul");
+		output.id = "dyk-stats-0";
+		
+		var body = getBody();
+		var dummy = body.getElementsByTagName("div")[0];
+		if (dummy.nextSibling && dummy.nextSibling.id === 'siteNotice') { // if siteNotice is below siteSub
+			dummy = dummy.nextSibling;
+		} else if (dummy.nextSibling.nextSibling && dummy.nextSibling.nextSibling.id === 'siteNotice') {
+			dummy = dummy.nextSibling.nextSibling;
+		}
+		dummy.parentNode.insertBefore(output, dummy.nextSibling);
+		createHeaderAndProcessing(output);
+		currentTitle = 0;
+		var title = mwConfig.wgTitle;
+		if (mwConfig.wgNamespaceNumber === 2) {
+			title = "User:" + title;
+		}
+		scanArticle(title, output, body);
+	}
+}
+
+function checkTTDYK() {
+	// finds the current nomination
+	// can jump to a section if it shows up in the URL
+	// (i.e. http://en.wikipedia.org/wiki/T:TDYK#Older_nominations)
+	// prepares for scan and passes info to checkHooks() and scanArticle() (through pit stop)
+
+	onTTDYK = true;
+	if (!sections) {
+		sections = document.getElementsByTagName("h4");
+		nextSection = getFirstNom();
+	}
+	// Jumping code
+	if (window.location.hash) {
+		var sectionAt = window.location.hash;
+		if (sectionAt !== urlJump) {
+			var jump = document.getElementById(sectionAt.substring(1, sectionAt.length));
+			var next = jump.parentNode;
+			while (next.nodeName.toLowerCase() !== "h4") {
+				next = next.nextSibling;
+			}
+			for (var iSection = 0; iSection < sections.length; iSection++) {
+				if (sections[iSection] === next) {
+					nextSection = iSection;
+					urlJump = sectionAt;
+					break;
+				}
+			}
+		}
+	}
+	
+	if (nextSection === sections.length) {
+		alert("Reached end of nominations; looping to beginning");
+		nextSection = getFirstNom();
+	}
+	if (document.getElementById("dyk-stats-0")) {
+		clearStats();
+	}
+	var firstOutput = document.createElement("ul");
+	firstOutput.id = "dyk-stats-0";
+	sections[nextSection].parentNode.insertBefore(firstOutput, sections[nextSection]);
+	var hook = checkHooks(firstOutput);
+	if (!hook) {
+		var hookErrorDisp = document.createElement("div");
+		hookErrorDisp.id = "error-disp";
+		hookErrorDisp.style.cssText = 'color:red; font-weight:bold;';
+		hookErrorDisp.innerHTML = 'Error: Hook is not formatted correctly';
+		firstOutput.parentNode.insertBefore(hookErrorDisp, firstOutput);
+		nextSection++;
+		return;
+	}
+	createHeaderAndProcessing(document.getElementById("dyk-stats-0"));
+	var tempHolder = document.createElement("div");
+	tempHolder.id = "temp-holder";
+	tempHolder.innerHTML = hook;
+	var bolded = tempHolder.getElementsByTagName("b");
+	var articleTitlesTemp = new Array(bolded.length);
+	var titlesCounter = 0;
+	for (var iBolded = 0; iBolded < bolded.length; iBolded++) {
+		var links = bolded[iBolded].getElementsByTagName("a");
+		if (links.length > 0) {
+			for (var iLink = 0; iLink < links.length; iLink++) {
+				var linkTitle = links[iLink].getAttribute("title");
+				if (!linkTitle) linkTitle = links[iLink].innerHTML; // links that aren't piped
+				articleTitlesTemp[titlesCounter] = linkTitle;
+				titlesCounter++;
+			}
+		} else {
+			var pointer = bolded[iBolded];
+			while (pointer !== tempHolder) {
+				if (pointer.nodeName.toLowerCase() === "a") {
+					var pointerTitle = pointer.getAttribute("title");
+					if (!pointerTitle) pointerTitle = pointer.innerHTML; // links that aren't piped
+					articleTitlesTemp[titlesCounter] = pointerTitle;
+					titlesCounter++;
+				}
+				pointer = pointer.parentNode;
+			}
+		}
+	}
+	currentTitle = 0;
+	articleTitles = new Array(titlesCounter);
+	var hookOutput = document.getElementById("hook-container");
+	for (var i = 0; i < titlesCounter; i++) {
+		var output;
+		if (i === 0) {
+			output = firstOutput;
+		} else {
+			output = document.createElement("ul");
+			output.id = "dyk-stats-" + i;
+			hookOutput.parentNode.insertBefore(output, hookOutput);
+		}
+		var articleDisp = document.createElement("li");
+		articleDisp.id = "article-title" + i;
+		output.appendChild(articleDisp);
+		articleDisp.innerHTML = '<b>Article ' + escapeHtml(i+1) + ':</b> ' + escapeHtml(articleTitlesTemp[i]);
+		articleTitles[i] = articleTitlesTemp[i];
+	}
+	if (titlesCounter === 1) {
+		document.getElementById("article-title0").innerHTML = '<b>Article:</b> ' + escapeHtml(articleTitles[0]);
+	} else if (titlesCounter === 0) {
+		if (document.getElementById("dyk-processing")) {
+			var processing = document.getElementById("dyk-processing");
+			processing.parentNode.removeChild(processing);
+		}
+		var boldErrorDisp = document.createElement("div");
+		boldErrorDisp.id = "error-disp";
+		boldErrorDisp.style.cssText = 'color:red; font-weight:bold;';
+		boldErrorDisp.innerHTML = document.createTextNode('Error: The nominated article must appear in bold');
+		sections[nextSection].parentNode.insertBefore(boldErrorDisp, firstOutput);
+		nextSection++;
+		return;
+	}
+	nextSection++;
+	checkTitle(articleTitles[0], firstOutput, 0);
+}
+
+function checkHooks(output) {
+	// gets the nomination section (complete with comments, etc) and passes this to helper function
+	// returns the last suggested hook so the parent method can find article titles
+	var hookOutput = document.createElement("ul");
+	hookOutput.id = "hook-container";
+	output.parentNode.insertBefore(hookOutput, output.nextSibling);
+	var bodyHTML = getBody().innerHTML;
+	var thisSection;
+	if (nextSection !== sections.length - 1) {
+		thisSection = bodyHTML.substring(bodyHTML.indexOf(sections[nextSection].innerHTML) + sections[nextSection].innerHTML.length, 
+				bodyHTML.indexOf(sections[nextSection+1].innerHTML));
+	} else {
+		thisSection = bodyHTML.substring(bodyHTML.indexOf(sections[nextSection].innerHTML) + sections[nextSection].innerHTML.length, 
+				bodyHTML.indexOf('NewPP limit report'));
+	}
+	thisSection = thisSection.replace('that,', 'that ').replace('...that ', '... that ');
+	if (thisSection.includes("5x expan")) {
+		nom5x = true;
+	} else {
+		nom5x = false;
+	}
+	return checkHooksHelper(hookOutput, thisSection, 0);
+}
+
+function checkHooksHelper(hookOutput, whatsLeft, num) {
+	// recursively finds proposed hooks for a nom
+	// identifies hooks starting with " ... that " and ending with "?"
+	// does not count "... " or "(pictured)" in hook character count
+	var hook;
+	var questionIndex = whatsLeft.indexOf("?");
+	var whatsLeftLowerCase = whatsLeft.toLowerCase();
+	while ((whatsLeftLowerCase.indexOf("<a ", questionIndex) > 
+			whatsLeftLowerCase.indexOf("</a>", questionIndex)) || 
+			((!whatsLeftLowerCase.includes("<a ", questionIndex)) && 
+			(whatsLeftLowerCase.includes("</a>", questionIndex))) ||
+			(whatsLeftLowerCase.indexOf("<i>", questionIndex) > 
+			whatsLeftLowerCase.indexOf("</i>", questionIndex)) || 
+			((!whatsLeftLowerCase.includes("<i>", questionIndex)) && 
+			(whatsLeftLowerCase.includes("</i>", questionIndex)))) {
+		questionIndex = whatsLeft.indexOf("?", questionIndex + 1);
+	}
+	if (whatsLeft.includes("... that ") && questionIndex !== -1) {
+		if (whatsLeft.indexOf("... that ") < questionIndex) {
+			hook = whatsLeft.substring(whatsLeft.indexOf("... that ") + 4, 
+					questionIndex + 1);
+			var hookTemp = document.createElement("div");
+			hookTemp.id = "hook-temp";
+			hookTemp.innerHTML = "<p>" + hook + "</p>";
+			var hookLength = calculateProse(hookTemp, false);
+			if (hookTemp.innerHTML.includes("pictured)") || 
+					hookTemp.innerHTML.includes("(pictured")) {
+				hookLength = hookLength - 10;
+			}
+			var hookDisp = document.createElement("li");
+			hookDisp.id = "hooks-" + num;
+			if (num === 0) {
+				hookDisp.innerHTML = '<b>Original Hook:</b> ' + escapeHtml(hookLength) + ' characters';
+			} else {
+				hookDisp.innerHTML = '<b>Alternate Hook ' + escapeHtml(num) +'</b>: ' +
+					escapeHtml(hookLength) + ' characters';
+			}
+			if (hookLength > hookLengthRed) {
+				hookDisp.style.cssText = 'background-color:pink';
+			} else if (hookLength > hookLengthYellow) {
+				hookDisp.style.cssText = 'background-color:yellow';
+			}
+			hookOutput.appendChild(hookDisp);
+			num = num + 1;
+		}
+		var parsed = whatsLeft.substring(questionIndex + 1, whatsLeft.length - 1);
+		var lastHook = checkHooksHelper(hookOutput, parsed, num);
+		if (!lastHook && hook) {
+			lastHook = hook;
+		}
+		return lastHook;
+	}
+	return;
+}
+
+function checkTitle(title, output, i) {
+	// gets the given title from Wikipedia's server and passes it to scanArticle(),
+	// resolving any redirects.
+	var promise = api.get({
+		format: 'json',
+		action: 'parse',
+		page: title,
+		redirects: true,
+		prop: 'text'
+	});
+	promise.done(function (obj) {
+		var ttdykTemp = document.createElement("div");
+		ttdykTemp.id = "ttdyk-temp" + i;
+		ttdykTemp.innerHTML = obj.parse.text["*"];
+		title = obj.parse.title; // Get the new title if we were redirected
+		scanArticle(title, output, ttdykTemp);
+	});
+	promise.fail(function () {
+		alert("API error");
+	});
+}
+
+function clearStats() {
+	// if scan results already exist, turn them off and remove highlighting
+	if (!onTTDYK) {
+		var oldStyle = document.getElementById("dyk-stats-0").className;
+		var mainContent = getBody();
+		var pList = mainContent.getElementsByTagName("p");
+		for (var iPara = 0; iPara < pList.length; iPara++) {
+			if (pList[iPara].parentNode === mainContent || pList[iPara].parentNode.parentNode === mainContent) {
+				pList[iPara].style.cssText = oldStyle;
+			}
+		}
+	}
+	if (document.getElementById("error-disp")) {
+		var errorDisp = document.getElementById("error-disp");
+		errorDisp.parentNode.removeChild(errorDisp);
+	}
+	var iStat = 0;
+	while (document.getElementById("dyk-stats-" + iStat)) {
+		var output = document.getElementById("dyk-stats-" + iStat);
+		output.parentNode.removeChild(output);
+		iStat++;
+	}
+	if (document.getElementById("hook-container")) {
+		var hookOutput = document.getElementById("hook-container");
+		hookOutput.parentNode.removeChild(hookOutput);
+	}
+	if (document.getElementById("dyk-header")) {
+		var header = document.getElementById("dyk-header");
+		header.parentNode.removeChild(header);
+	}
+	if (document.getElementById("dyk-processing")) {
+		var processing = document.getElementById("dyk-processing");
+		processing.parentNode.removeChild(processing);
+	}
+}
+
+function calculateProse(doc, visible) {
+	// calculates the prose of a given document
+	// this function and its helper below are modified versions of
+	// the prosesize tool (http://en.wikipedia.org/wiki/User:Dr_pda/prosesize.js)
+	var pList = doc.getElementsByTagName("p");
+	var prose_size = 0;
+	
+	var i = 0;
+	if (mwConfig.wgAction === 'submit' && visible) i = 1; // Avoid the "Remember that this is only a preview" text
+	for (; i < pList.length; i++) {
+		if (pList[i].parentNode.parentNode === doc || pList[i].parentNode.parentNode.parentNode.id === getBodyId()) {
+			prose_size += getReadable(pList[i], visible);
+			if (!onTTDYK && visible) {
+				pList[i].style.cssText = 'background-color:yellow';
+			}
+		}
+	}
+	return prose_size;
+}
+
+function getReadable(id, visible) {
+	// helper method for calculateProse()
+	var textReadable = 0;
+	for (var i = 0; i < id.childNodes.length; i++) {
+		if (id.childNodes[i].nodeName === '#text') {
+			textReadable += id.childNodes[i].nodeValue.length;
+		} else if (id.childNodes[i].className !== 'reference' && 
+				!(id.childNodes[i].className && id.childNodes[i].className.includes('emplate')) &&
+				id.childNodes[i].id !== 'coordinates') {
+			textReadable += getReadable(id.childNodes[i], visible);
+		} else if (visible) { // if it's an inline maintenance tag (like [citation needed]) or geocoordinates
+			if (document.getElementById("dyk-stats-0").className) {
+				id.childNodes[i].style.cssText = document.getElementById("dyk-stats-0").className;
+			} else {
+				id.childNodes[i].style.cssText = 'background-color:white';
+			}	
+		}
+	}
+	return textReadable;
+}
+
+function checkExpansion(title, output, current) {  
+	// finds the start of expansion date (last 500 edits)
+	// gets the last 500 unique revision ids for past revisions of the article and passes to helper function
+	var promise = getRevisions({
+		titles: title,
+		rvlimit: 500,
+		rvprop: ['ids', 'timestamp', 'sha1'],
+		rvdir: 'older'
+	});
+	promise.done(function (revisionsWithDeletedRevs) {
+		var revisions = revisionsWithDeletedRevs.filter(revision => 'sha1' in revision);
+		var expandTemp = document.createElement("div");
+		expandTemp.id = "expand-temp";
+		checkExpansionHelper(title, current, output, expandTemp, revisions, 0, revisions.length-1, -1);
+	});
+}
+
+function checkExpansionHelper(title, current, output, expandTemp, revisions, min, max, expandIndex) {
+	// helper for expansion check, used recursively
+	// searches for start of expansion date using a binary search algorithm
+	// assumes the article has been more or less increasing in size all the time
+	// if the article length has yoyo-ed, this function won't give accurate results
+	var mid = Math.ceil((max + min)/2);
+	if ((((max - min) < 2) && (max !== revisions.length - 1 || expandIndex !== -1)) || expandIndex === -2) {
+		var expandResult = document.createElement("li");
+		expandResult.id = "expand-result";
+		output.appendChild(expandResult);
+		if (expandIndex < 0) {
+			if (revisions.length === 500) {
+				expandResult.innerHTML = escapeHtml('Article has not been expanded 5x in the last 500 edits');
+			} else {
+				expandResult.innerHTML = escapeHtml('Article has not been expanded 5x since it was created');
+			}
+		} else {
+			var date = revisions[expandIndex-1].timestamp;
+			expandResult.innerHTML = 'Assuming article is at 5x now, expansion began ' + 
+					escapeHtml(expandIndex) + ' edits ago on ' + escapeHtml(toNormalDate(date.substring(0,10)));
+			dates[2] = toDateObject(date);
+		}
+		partsProcessing[3] = true;
+		doneProcessing();
+		return;
+	} else if ((max - min) < 2 && max === revisions.length - 1) {
+		expandIndex = -2;
+	}
+	var promise = api.get({
+		format: 'json',
+		action: 'parse',
+		oldid: revisions[mid].revid,
+		prop: 'text'
+	});
+	promise.done(function (obj) {
+		expandTemp.innerHTML = obj.parse.text['*'];
+		var prose = calculateProse(expandTemp, false);
+		// alert("Prose: " + prose + " 1x: " + current/5 + " Mid: " + mid + " Expand index: " + expandIndex); 
+		// use above line to debug the expansion check
+		if (prose < (current/5.0)) {
+			if ((expandIndex > mid) || (expandIndex < 0)) {
+				expandIndex = mid;
+			}
+			checkExpansionHelper(title, current, output, expandTemp, revisions, min, mid, expandIndex);
+		} else {
+			checkExpansionHelper(title, current, output, expandTemp, revisions, mid, max, expandIndex);
+		}
+	});
+	promise.fail(function () {
+		alert("API error");
+		partsProcessing[3] = true;
+		doneProcessing();
+	});
+}
+
+function checkTalk(title, output) { 
+	// checks the talk page of the article for DYK, ITN, or stub templates
+	if (mwConfig.wgNamespaceNumber !== 2) {
+		title = "Talk:" + title;
+	} else {
+		title = title.replace("User:", "User talk:");
+	}
+	var promise = getRevisions({
+		titles: title,
+		rvprop: 'content'
+	});
+	promise.done(function (revisions) {
+		if (revisions && revisions[0]) {
+			var talkPage = revisions[0]['*'];
+			var result = '';
+			var color = '';
+			if (talkPage.match(/class\s*=\s*[sS]tub/) && 
+					(document.getElementById("stub-alert") === null)) {
+				result += 'Article is classified as a stub ';
+				color = 'yellow';
+			}
+			var dyktalkRegexMatches = talkPage.match(/{{\s*[dD](yk|YK\s?)talk[^}]*}}/g);
+			if (dyktalkRegexMatches) {
+				// if there's a DYK tag, try to find the date of previous appearance
+				result += 'Article has appeared on Did You Know before ';
+				var dyktalkTag = dyktalkRegexMatches.pop();
+				var firstPipeIndex = dyktalkTag.indexOf('|');
+				var secondPipeIndex = dyktalkTag.indexOf('|', firstPipeIndex + 1);
+				var thirdPipeIndex = dyktalkTag.indexOf('|', secondPipeIndex + 1);
+				if (firstPipeIndex !== -1 && secondPipeIndex !== -1) {
+					if (thirdPipeIndex === -1) {
+						thirdPipeIndex = dyktalkTag.length - 2; // -2 to get rid of the }}
+					}
+					var monthDate = dyktalkTag.substring(firstPipeIndex + 1, secondPipeIndex);
+					var year = dyktalkTag.substring(secondPipeIndex + 1, thirdPipeIndex);
+					var featuredDate = new Date(monthDate + " " + year);
+					if (featuredDate.toString() !== 'Invalid Date') {
+						var month = featuredDate.getMonth() + 1;
+						if (month < 10) {
+							month = '0' + month;
+						}
+						var date = featuredDate.getDate();
+						if (date < 10) {
+							date = '0' + date;
+						}
+						var dateString = toNormalDate(featuredDate.getFullYear() + '-' + month + '-' + date);
+						result = result.substring(0, result.length - 1) + ', on ' + escapeHtml(dateString);
+					}
+				}
+				color = 'pink';
+			} else if (talkPage.match(/rticle[ ]?[hH]istory[\s\S]*dykdate\s*=.*?\S/)) {
+				result += 'Article has appeared on Did You Know before ';
+				color = 'pink';
+			}
+			if (talkPage.match(/{{\s*[iI]TN(\st|t|T)alk/)) { // {{ITNtalk}}, {{ITN talk}}, {{ITNTalk}}
+				result += 'Article has appeared on In The News before ';
+				color = 'pink';
+			}
+			if (result) {
+				var talkResult = document.createElement("li");
+				talkResult.id = "talk-result";
+				output.appendChild(talkResult);
+				talkResult.innerHTML = result;
+				if (color) {
+					talkResult.style["background-color"] = color;
+				}
+			}
+			checkTalkForGoodArticleStatus(talkPage, output);
+		}
+		partsProcessing[0] = true;
+		doneProcessing();
+	});
+	promise.fail(function () {
+		partsProcessing[0] = true;
+		doneProcessing();
+	});
+}
+
+function checkTalkForGoodArticleStatus(talkPage, output) {
+	// Test cases:
+	// Cathedral of the Immaculate Conception (Moscow) - ArticleHistory, two GANs (last successful), currently a featured article
+	// LoveGame - ArticleHistory, one successful GAN, no GARs
+	// Paparazzi (Lady Gaga song) - ArticleHistory, one successful GAN, unlisted after a GAR, another successful GAN, no-op GAR
+	// Curtis (50 Cent album) - ArticleHistory, one successful GAN, unlisted after a GAR
+	// G.U.Y. - ArticleHistory with unconventional formatting
+	// Arthur Adams (comics) - ArticleHistory with unconventional formatting
+	// Blackburn Firebrand - {{GA}}
+	// Tony Hawk's Underground - {{GA}} with confounding {{Game}} tag
+	var gaDate = '';
+	var gaRegexMatches = talkPage.match(/{{\s*[gG][aA]\s*[|][^}]*}}/g);
+	if (gaRegexMatches) {
+		// if there's a GA tag, try to find the date of promotion to Good Article
+		var gaTag = gaRegexMatches.pop();
+		var firstPipeIndex = gaTag.indexOf('|');
+		var secondPipeIndex = gaTag.indexOf('|', firstPipeIndex + 1);
+		if (firstPipeIndex !== -1) {
+			if (secondPipeIndex === -1) {
+				secondPipeIndex = gaTag.length - 2; // -2 to get rid of the }}
+			}
+			gaDate = gaTag.substring(firstPipeIndex + 1, secondPipeIndex);
+		}
+	} else if (talkPage.match(/rticle[ ]?[hH]istory/)) {
+		// check ArticleHistory tag for Good Article status
+		
+		// grab last GAN action
+		// figure out action number
+		// given action number, was action result "listed"?
+		// if no, stop here - article is not a Good Article
+		// if yes, grab the Good Article promotion date from actionXdate
+		var ganMatches = talkPage.match(/action[0123456789]+\s*=\s*(gan|GAN)/g);
+		if (ganMatches) {
+			var lastGanAction = ganMatches.pop();
+			var lastGanActionNumber = lastGanAction.substring(6, lastGanAction.indexOf('=')); // remove 'action' and everything at and after the equals sign
+			lastGanActionNumber = lastGanActionNumber.trim();
+			var ganResultIndex = talkPage.indexOf('action' + lastGanActionNumber +  'result');
+			var ganResult = talkPage.substring(talkPage.indexOf('=', ganResultIndex) + 1, talkPage.indexOf('|', ganResultIndex)).trim();
+			if (ganResult === 'listed' || ganResult === 'Listed' || ganResult === 'passed' || ganResult === 'Passed') {
+				var ganDateIndex = talkPage.indexOf('action' + lastGanActionNumber +  'date');
+				gaDate = talkPage.substring(talkPage.indexOf('=', ganDateIndex) + 1, talkPage.indexOf('|', ganDateIndex)).trim();
+			}
+			
+			// then grab last GAR action
+			// figure out action number
+			// is GAR action number after GAN action number? if yes, carry on
+			// given action number, was action result "not listed"?
+			// if yes, article is not a Good Article
+			var garMatches = talkPage.match(/action[0123456789]+\s*=\s*(gar|GAR)/g);
+			if (garMatches) {
+				var lastGarAction = garMatches.pop();
+				var lastGarActionNumber = lastGarAction.substring(6, lastGarAction.indexOf('=')); // remove 'action' and everything at and after the equals sign
+				lastGarActionNumber = lastGarActionNumber.trim();
+				if (parseInt(lastGarActionNumber) > parseInt(lastGanActionNumber)) {
+					var garResultIndex = talkPage.indexOf('action' + lastGarActionNumber +  'result');
+					var garResult = talkPage.substring(talkPage.indexOf('=', garResultIndex) + 1, talkPage.indexOf('|', garResultIndex)).trim();
+					if (garResult === 'delisted' || garResult === 'Delisted') {
+						gaDate = ''; // Not a Good Article, GAR came after GAN and demoted the article
+					}
+				}
+			}
+		}
+	}
+	
+	if (gaDate) {
+		if (gaDate.length > 6 && gaDate.indexOf(' (UTC)') === gaDate.length - 6) {
+			gaDate = gaDate.substring(0, gaDate.length - 6); // The Boat Race 1997 is not parsing correctly if (UTC) is left in
+		}
+		if (gaDate.length > 5 && gaDate[2] === ':' && gaDate[5] === ',') {
+			gaDate = gaDate.substring(6, gaDate.length).trim(); // Chrome not parsing as expected for strings like "17:21, 26 June 2014"
+		}
+		
+		var gaPromotion = document.createElement("li");
+		gaPromotion.id = "ga-promotion";
+		output.appendChild(gaPromotion);
+		var gaPromotedDate = new Date(gaDate);
+		
+		// ensure the Date object is in the right time zone
+		gaPromotedDate = new Date(Date.UTC(gaPromotedDate.getFullYear(), gaPromotedDate.getMonth(), gaPromotedDate.getDate(), gaPromotedDate.getHours(), gaPromotedDate.getMinutes(), gaPromotedDate.getSeconds()));
+		
+		dates[3] = gaPromotedDate;
+		gaPromotion.innerHTML = 'Article was promoted to Good Article status on ' +
+			escapeHtml(toNormalDate(gaPromotedDate.toISOString()));
+	}
+}
+
+function getRevisions(options) {
+	// Returns a jQuery promise with an array of a title's revisions.
+	// The first parameter is an options object accepting the following API fields:
+	// - titles
+	// - rvlimit
+	// - rvprop
+	// - rvdir
+	options = options || {};
+	return api.get({
+		format: 'json',
+		action: 'query',
+		prop: 'revisions',
+		titles: options.titles,
+		rvlimit: options.rvlimit,
+		rvprop: options.rvprop,
+		rvdir: options.rvdir,
+		indexpageids: true
+	}).then(
+		// On success
+		function (obj) {
+			var pageId = obj.query.pageids[0];
+			return obj.query.pages[pageId].revisions;
+		},
+		// On failure
+		function (err) {
+			alert("API error");
+			return err;
+		}
+	);
+}
+
+function getFirstRevision(title, output) {
+	// finds the creator of the article, and the date created
+	// also checks if the article was created as a redirect, finds non-redirect date if so
+
+	var created = document.createElement("li");
+	created.id = "creation-info";
+	output.appendChild(created);
+		
+	var promise = getRevisions({
+		titles: title,
+		rvlimit: 4,
+		rvprop: ['timestamp', 'user', 'content'],
+		rvdir: 'newer'
+	});
+	promise.done(function (revisions) {
+		var user = revisions[0].user;
+		var timestamp = revisions[0].timestamp;
+		created.innerHTML='<b>Article created </b> by ' + escapeHtml(user) + 
+				' on ' + escapeHtml(toNormalDate(timestamp.substring(0,10)));
+		dates[0] = toDateObject(timestamp);
+		for (var i = 0; i < revisions.length; i++) {
+			var content = revisions[i]['*'];
+			var isRedirect = content.replace(' ', '').replace(':', '').toUpperCase().includes('#REDIRECT[[');
+			if (isRedirect && i === 0) {
+				created.innerHTML = created.innerHTML + ' as a redirect';
+			} else if (!isRedirect) {
+				if (i !== 0) {
+					var unRedirect = document.createElement("li");
+					unRedirect.id = "expanded-from-redirect";
+					output.appendChild(unRedirect);
+					var urUser = revisions[i].user;
+					var urTimestamp = revisions[i].timestamp;
+					unRedirect.innerHTML = 'Article became a non-redirect on ' + 
+							escapeHtml(toNormalDate(urTimestamp.substring(0,10))) +
+							' by ' + escapeHtml(urUser);
+					dates[0] = toDateObject(urTimestamp);
+				}
+				break;
+			}
+		}
+		partsProcessing[1] = true;
+		doneProcessing();
+	});
+	promise.fail(function () {
+		partsProcessing[1] = true;
+		doneProcessing();
+	});
+}
+
+function checkMove(title, output) { 
+	//checks the last 100 edits of an article for a move from userspace or AfC to current location
+	var promise = getRevisions({
+		titles: title,
+		rvlimit: 100,
+		rvprop: ['flags', 'user', 'timestamp', 'comment'],
+		rvdir: 'older',
+	});
+	promise.done(function (revisions) {
+		for (var i = 0; i < revisions.length; i++) {
+			var comment = revisions[i].comment;
+			var userName = revisions[i].user;
+			if ((revisions[i].minor === "") && 
+					comment.match(/moved (page )?((\[\[User:)|(\[\[Draft:)|(\[\[Wikipedia talk:Articles for creation\/))[\s\S]*to \[\[/)) {
+				var movedFrom = comment.substring(comment.indexOf("[[") + 2, comment.indexOf("to [[") - 3);
+				var date = revisions[i].timestamp;
+				var moved = document.createElement("li");
+				moved.id = "moved-userspace";
+				output.appendChild(moved);
+				moved.innerHTML = '<b>Article moved</b> from ' + escapeHtml(movedFrom) + 
+						' on ' + escapeHtml(toNormalDate(date.substring(0,10)));
+				dates[1] = toDateObject(date);
+				break;
+			}
+		}
+		partsProcessing[2] = true;
+		doneProcessing();
+	});
+	promise.fail(function () {
+		partsProcessing[2] = true;
+		doneProcessing();
+	});
+}
+
+function doneProcessing() {
+	// checks if all parts are done processing
+	// if they are, the dates of creation and expansion are checked for within 10 days (rounded down, in nominator's favor)
+	// then the next title (for multiple article noms) is processed (required to combat asynchronous threads)
+	// if there are no more titles left (or not on T:TDYK), the processing message is removed
+	var titleComplete = true;
+	for (var i = 0; i < partsProcessing.length; i++) {
+		if (!partsProcessing[i]) {
+			titleComplete = false;
+			break;
+		}
+	}
+	if (document.getElementById("dyk-processing") && titleComplete) {
+		var curDate = new Date();
+		var winner = new Date();
+		if (dates[1]) {
+			winner = dates[1]; 
+		} else {
+			winner = dates[0];
+		}
+		if (dates[2] > winner) {
+			winner = dates[2];
+		}
+		if (dates[3] > winner) {
+			winner = dates[3];
+		}
+		var dateDifference = Math.floor((curDate.getTime() - winner.getTime())/(1000*60*60*24));
+		if (dateDifference > 10) {
+			var output = document.getElementById("dyk-stats-" + currentTitle);
+			var notRecent = document.createElement("li");
+			notRecent.id = "not-recent";
+			output.appendChild(notRecent);
+			if (!onTTDYK || (check5xNoms === "always") || (check5xNoms === "ifnom5x" && nom5x)) {
+				notRecent.innerHTML = "Article has not been created or expanded 5x or promoted to Good Article within the past 10 days (" + 
+						escapeHtml(dateDifference) + " days)" + " <small>DYKcheck does not account for previous versions with " +
+						'<a href="//en.wikipedia.org/wiki/Wikipedia:Split">splits</a> or ' +
+						'<a href="//en.wikipedia.org/wiki/Wikipedia:Copyright_violations">copyright violations</a>.</small>';
+			} else {
+				notRecent.innerHTML = "Article was not created within the past 10 days (" + escapeHtml(dateDifference) + " days)";
+			}
+			notRecent.style.cssText = 'background-color:pink';
+		}
+		if (onTTDYK && currentTitle < (articleTitles.length - 1)) {
+			currentTitle++;
+			checkTitle(articleTitles[currentTitle], 
+					document.getElementById("dyk-stats-" + (currentTitle)), currentTitle);
+		} else {
+			var processing = document.getElementById("dyk-processing");
+			processing.parentNode.removeChild(processing);
+		}
+	}
+}
+
+// taken from the prosesize tool (http://en.wikipedia.org/wiki/User:Dr_pda/prosesize.js)
+function getBodyId() {
+	var contentName;
+	if (mwConfig.skin === 'monobook' || mwConfig.skin === 'chick' || mwConfig.skin === 'mymwConfig.skin' || mwConfig.skin === 'simple') {
+		contentName = 'bodyContent';
+	} else if (mwConfig.skin === 'modern') {
+		contentName = 'mw_contentholder';
+	} else if (mwConfig.skin === 'standard' || mwConfig.skin === 'cologneblue' || mwConfig.skin === 'nostalgia') {
+		contentName = 'article';
+	} else {
+		// fallback case; the above covers all currently existing skins
+		contentName = 'bodyContent';
+	}
+	// Same for all skins if previewing page
+	if (mwConfig.wgAction === 'submit') contentName = 'wikiPreview';
+	return contentName;
+}
+
+function getBody() { 
+	// gets the HTML body of the page
+	// taken from the prosesize tool (http://en.wikipedia.org/wiki/User:Dr_pda/prosesize.js)
+	return document.getElementById(getBodyId());
+}
+
+function getFirstNom() {
+	var firstNom = 0;
+	
+	// Find the first "Articles created/expanded on ..." h3 section
+	var elementIterator = sections[firstNom].previousSibling;
+	while (elementIterator.nodeName.toLowerCase() !== "h3") {
+		elementIterator = elementIterator.previousSibling;
+	}
+	while (!(elementIterator.nodeName.toLowerCase() === "h3" && 
+			elementIterator.innerHTML.includes("Articles created/expanded on"))) {
+		if (elementIterator.nodeName.toLowerCase() === "h4") {
+			firstNom++;
+		}
+		elementIterator = elementIterator.nextSibling;
+	}
+	return firstNom;
+}
+
+function createHeaderAndProcessing(output) { 
+	// makes the header above the scan results
+	var header = document.createElement("span");
+	header.id = "dyk-header";
+	header.innerHTML = '<br /><b>DYK eligibility scan results: <small><i>(See <a href="//en.wikipedia.org/wiki/' + 
+			'User:Shubinator/DYKcheck">here</a> for details.)</i></small></b>';
+	output.parentNode.insertBefore(header,output);
+	var processing = document.createElement("span");
+	processing.id = "dyk-processing";
+	processing.innerHTML = '<br /><b><font color="crimson"> Processing... </font></b>';
+	output.parentNode.insertBefore(processing, header);
+}
+
+function toNormalDate(utc) { 
+	// converts the date part of a Wikipedia timestamp to a readable date
+	var months = new Array("blank","January","February", "March", "April", "May", "June", 
+			"July", "August", "September", "October", "November", "December");
+	if (dateFormat === "british") {
+		return (utc.substring(8,10) * 1) + ' ' + months[utc.substring(5,7) * 1] + ' ' + utc.substring(0,4);
+	} else {
+		return months[utc.substring(5,7) * 1] + ' ' + (utc.substring(8,10) * 1) + ', ' + utc.substring(0,4);
+	}
+}
+
+function toDateObject(timestamp) { 
+	// converts a Wikipedia timestamp to a Javascript Date object
+	var date = new Date();
+	date.setUTCFullYear(timestamp.substring(0,4), timestamp.substring(5,7) - 1, timestamp.substring(8,10));
+	date.setUTCHours(timestamp.substring(11,13), timestamp.substring(14,16), timestamp.substring(17,19));
+	return date;
+}
+
+function fixSidebar() { // part of the code to fix the sidebar; the rest is below the addToolbarPortletLink function
+	// this function is only necessary for the monobook skin
+	var content = document.getElementById("column-content");    // Find the main content column
+
+	var footer = document.getElementById("footer");  // Find the footer
+	footer.parentNode.removeChild(footer);    // Remove the footer from the global wrapper
+	content.appendChild(footer);    // Place footer at the end of the content column;
+
+	var tabs = document.getElementById("p-cactions");   // Find the top tab list
+	tabs.parentNode.removeChild(tabs);    // Remove the tab list from the side column
+	content.insertBefore(tabs, content.lastChild);    // Place tab list in the content column
+
+	var personal = document.getElementById("p-personal");   // Find the personal links list
+	personal.parentNode.removeChild(personal);    // Remove the personal links list from the side column
+	content.insertBefore(personal, content.lastChild);    // Place personal links list in the content column
+}
+
+window.dykCheck = function () { 
+	// this function for casual use and anons
+	if (((mwConfig.wgAction === 'view' || mwConfig.wgAction === 'submit' || mwConfig.wgAction === 'purge') && 
+			(mwConfig.wgNamespaceNumber === 0 || mwConfig.wgNamespaceNumber === 2)) || unlock) {
+		checkDocument();
+	} else if (mwConfig.wgPageName === 'Template_talk:Did_you_know') {
+		checkTTDYK();
+	}
+};
+
+function addToolbarPortletLink(func, tooltip) {
+	var link = mw.util.addPortletLink(
+		'p-tb',
+		'#',
+		'DYK check',
+		't-dyk-check',
+		tooltip
+	);
+	$( link ).click( function (e) {
+		e.preventDefault();
+		func();
+	});
+}
+
+// Add toolbar portlet links
+if (unlock || (
+		(mwConfig.wgAction === 'view' || mwConfig.wgAction === 'submit' || mwConfig.wgAction === 'purge') && 
+		(mwConfig.wgNamespaceNumber === 0 || mwConfig.wgNamespaceNumber === 2)
+)) {
+	addToolbarPortletLink(checkDocument, 'Check if this article qualifies for DYK');
+} else if (mwConfig.wgPageName === 'Template_talk:Did_you_know') {
+	addToolbarPortletLink(checkTTDYK, 'Check DYK nominations for eligibility');
+}
+
+// Fix the sidebar
+if (mwConfig.wgUserName && mwConfig.skin === 'monobook' && (
+		fixedSidebar === "always" ||
+		fixedSidebar === "onttydk" && mwConfig.wgPageName === 'Template_talk:Did_you_know'
+)) {
+	fixSidebar();
+}
+
+// The code below for the fixed sidebar is a blend of two sources:
+//		http://meta.wikimedia.org/wiki/Help:User_style/floating_quickbar 
+// 		http://en.wikipedia.org/wiki/User:Omegatron/monobook.js/floatingSidebar.js
+// Very little of the code below was written by me (Shubinator)
+
+// This CSS should be hidden from older versions of IE using javascript instead of the attribute selector?
+
+// Include style sheet inline so that script is self-contained:
+if (mwConfig.wgUserName && (
+		fixedSidebar === "always" ||
+		fixedSidebar === "onttydk" && mwConfig.wgPageName === 'Template_talk:Did_you_know'
+)) {
+	var head = document.getElementsByTagName("head")[0];
+	var style = document.createElement('style');
+	style.type = 'text/css';
+	var sidebarDivHidden;
+	var sidebarDiv;
+	var langBody;
+	if (mwConfig.skin === 'vector') { // default skin  (as of May 2010)
+		sidebarDivHidden = 'div#mw-panel';
+		sidebarDiv = 'div#mw-panel';
+		langBody = '#p-lang .body';
+	} else { // monobook, modern, and simple skins
+		if (mwConfig.skin === 'modern') {
+			sidebarDivHidden = 'div[id=mw_portlets]';
+		} else if (mwConfig.skin === 'simple') {
+			sidebarDivHidden = '#column-one';
+		} else { // monobook skin
+			sidebarDivHidden = 'div[id=column-one]'; /* Using the attribute selector hides this from IE */
+		}
+		sidebarDiv = '#column-one';
+		langBody = '#p-lang .pBody';
+	}
+	var cssText = "   /* Fix the sidebar's position while you scroll */             "+
+	    sidebarDivHidden + ' {                                                      '+
+	'       position: fixed;                                                        ';
+	if (mwConfig.skin === 'vector') { // force the sidebar to the upper left; only necessary in some skins
+	    cssText += 'left: 0px;                                                      '+
+	    '   top: 0px;                                                               ';
+	} else if (mwConfig.skin === 'monobook') {
+	    cssText += 'left: 0px;                                                      '+
+	    '   top: -160px;                                                            ';
+	}
+	cssText += 'height: 100%;   /* If you shrink the browser too small, the     */  '+
+	'       overflow: auto;     /* side column will become scrollable, so stuff */  '+
+	'       z-index: 2;         /* is always accessible, albeit ugly            */  '+
+	'   }                                                                           '+
+	'                                                                               '+
+	'   #p-logo {               /* Make logo inline with other divs             */  '+
+	'       position:static;                                                        '+
+	'   }                                                                           '+
+	'                                                                               '+
+	    sidebarDiv       + ' {  /* Sidebar column start at the top screen edge  */  '+
+	'       padding-top: 0;                                                         '+
+	'   }                                                                           '+
+	'                                                                               '+
+	    langBody + 	  ' ul{      /* Sets the language box to a fixed height and  */ '+
+	'       height: 6em;        /* scrollable if too long to fit on screen      */  '+
+	'       overflow: auto;                                                         '+
+	'   }                                                                           '+
+	'                                                                               '+
+	'   /* Fix the background image, too, so it looks nice as you scroll */         '+
+	'   body {                                                                      '+
+	'       background-attachment: fixed;                                           '+
+	'   }                                                                           '+
+	'                                                                               '+
+	"   /* Fix the footer so it looks nice and doesn't overlap the sidebar */       "+
+	'   #footer {                                                                   '+
+	'       margin-left: 13.6em;                                                    '+
+	'       border-left: solid 1px rgb(250, 189, 35);                               '+
+	'       -moz-border-radius-topleft: 1em;                                        '+
+	'       -moz-border-radius-bottomleft: 1em;                                     '+
+	'   }                                                                           ';
+	if (mwConfig.skin === 'monobook') {
+	    cssText += 	'   /* Keep personal links at the top right */                  '+
+	'   #p-personal {                                                               '+
+	'       width:100%;                                                             '+
+	'       white-space:nowrap;                                                     '+
+	'       padding:0 0 0 0;                                                        '+
+	'       margin:0;                                                               '+
+	'       position:absolute;                                                      '+
+	'       left:0px;                                                               '+
+	'       top:0px;                                                                '+
+	'       z-index: 0;                                                             '+
+	'       border: none;                                                           '+
+	'       background: none;                                                       '+
+	'       overflow: visible;                                                      '+
+	'       line-height: 1.2em;                                                     '+
+	'   }                                                                           '+
+	'                                                                               '+
+	'   #p-personal h5 {                                                            '+
+	'       display:none;                                                           '+
+	'   }                                                                           '+
+	'   #p-personal .portlet,                                                       '+
+	'   #p-personal .pBody {                                                        '+
+	'       padding:0;                                                              '+
+	'       margin:0;                                                               '+
+	'       border: none;                                                           '+
+	'       z-index:0;                                                              '+
+	'       overflow: visible;                                                      '+
+	'       background: none;                                                       '+
+	'   }                                                                           '+
+	'   /* this is the ul contained in the portlet */                               '+
+	'   #p-personal ul {                                                            '+
+	'       border: none;                                                           '+
+	'       line-height: 1.4em;                                                     '+
+	'       color: #2f6fab;                                                         '+
+	'       padding: 0em 2em 0 3em;                                                 '+
+	'       margin: 0;                                                              '+
+	'       text-align: right;                                                      '+
+	'       text-transform: lowercase;                                              '+
+	'       list-style: none;                                                       '+
+	'       z-index:0;                                                              '+
+	'       background: none;                                                       '+
+	'   }                                                                           '+
+	'   #p-personal li {                                                            '+
+	'       z-index:0;                                                              '+
+	'       border:none;                                                            '+
+	'       padding:0;                                                              '+
+	'       display: inline;                                                        '+
+	'       color: #2f6fab;                                                         '+
+	'       margin-left: 1em;                                                       '+
+	'       line-height: 1.2em;                                                     '+
+	'       background: none;                                                       '+
+	'   }                                                                           '+
+	'   #p-personal li a {                                                          '+
+	'       text-decoration: none;                                                  '+
+	'       color: #005896;                                                         '+
+	'       padding-bottom: 0.2em;                                                  '+
+	'       background: none;                                                       '+
+	'   }                                                                           '+
+	'   #p-personal li a:hover {                                                    '+
+	'       background-color: White;                                                '+
+	'       padding-bottom: 0.2em;                                                  '+
+	'       text-decoration: none;                                                  '+
+	'   }                                                                           '+
+	'   /* Keep the small user figure left of your user name */                     '+
+	'   li#pt-userpage,                                                             '+
+	'   li#pt-anonuserpage,                                                         '+
+	'   li#pt-login {                                                               '+
+	'       background: url(/skins-1.5/monobook/user.gif) top left no-repeat;       '+
+	'       padding-left: 20px;                                                     '+
+	'       text-transform: none;                                                   '+
+	'   }                                                                           '+
+	'                                                                               ';
+	}
+	var rules = document.createTextNode(cssText);
+	if (style.styleSheet) {
+		style.styleSheet.cssText = rules.nodeValue;
+	} else {
+		style.appendChild(rules);
+	}
+	head.appendChild(style);
+}
+
+});
